@@ -59,49 +59,86 @@ Stop it with `sudo docker compose down`. **`sudo docker compose down -v` permane
 ## Architecture
 
 ```
-                        ┌──────────────────────────────────────────────┐
-                        │  apps/  (transport and composition)           │
-                        │                                               │
-                        │  ┌─────────────┐    ┌──────────────────────┐ │
-                        │  │  apps/api   │    │    apps/gateway      │ │
-  HTTP (127.0.0.1) ────▶│  │  /health/*  │    │  /internal/model/*   │ │
-                        │  │             │    │  ExecutionPipeline   │ │
-                        │  └──────┬──────┘    └──────────┬───────────┘ │
-                        └─────────│──────────────────────│─────────────┘
-                                  │                      │
-                        ┌─────────▼──────────────────────▼─────────────┐
-                        │  core/  (no HTTP knowledge)                   │
-                        │                                               │
-                        │  ┌──────────┐  ┌────────────┐  ┌──────────┐  │
-                        │  │  health  │  │model_router│  │governance│  │
-                        │  │ domain   │  │  domain    │  │  domain  │  │
-                        │  │ appl.    │  │  appl.     │  │  appl.   │  │
-                        │  │ infra.   │  │  infra.    │  │  infra.  │  │
-                        │  └────┬─────┘  └─────┬──────┘  └────┬─────┘  │
-                        │       │               │              │        │
-                        │  ┌────┴───────────────┴──────────────┴──────┐ │
-                        │  │          core/foundation (settings, DB)  │ │
-                        │  │          core/contracts  (shared DTOs)   │ │
-                        │  └───────────────────────────────────────┬──┘ │
-                        └──────────────────────────────────────────│────┘
-                                                                   │
-                        ┌──────────────────────────────────────────▼────┐
-                        │  PostgreSQL 18                                  │
-                        │                                               │
-                        │  migrator role (DDL):  all tables             │
-                        │  app role (DML):       model_registry (SEL)   │
-                        │                        cost_ledger (INS+SEL)  │
-                        │  governance role (DML):                       │
-                        │    policy_version  (INS+SEL)                  │
-                        │    verdict         (INS+SEL)                  │
-                        │    approval        (INS+SEL+UPD)              │
-                        │    budget          (SEL)                      │
-                        │    emergency_state (SEL)                      │
-                        │    audit_log       (INS+SEL)                  │
-                        └───────────────────────────────────────────────┘
+  Request lifecycle (Gateway — execute / stream)
+  ───────────────────────────────────────────────────────────────
 
-  apps/gateway ──────────────────────────────────────────▶  DeepSeek API
-  (holds provider credential; no other process does)
+  Incoming request
+       │
+       ▼
+  ┌─────────────────────────────────┐
+  │  X-Internal-Secret auth check   │  fail ──▶  401
+  └────────────────┬────────────────┘
+                   │ pass
+                   ▼
+  ┌─────────────────────────────────┐
+  │  EmergencyState check           │  active ──▶  GovernanceDeniedError
+  │  (governance role, SEL)         │
+  └────────────────┬────────────────┘
+                   │ none active
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Policy evaluation              │  DENY ──▶  GovernanceDeniedError
+  │  deny-by-default; unknown → L4  │            (never retried)
+  └────────────────┬────────────────┘
+                   │ ALLOW
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Approval gate (L3 only)        │  missing / expired / hash mismatch
+  │  verify: status=approved,       │  ──▶  GovernanceDeniedError
+  │  not expired, payload_hash OK,  │
+  │  not consumed → consume()       │
+  └────────────────┬────────────────┘
+                   │ approved
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Budget check                   │  (Phase 4 — wiring deferred)
+  └────────────────┬────────────────┘
+                   │
+                   ▼
+  ┌─────────────────────────────────┐   retry ≤3
+  │  Provider call                  │◀──────────────┐
+  │  (DeepSeek adapter)             │               │
+  └────────────────┬────────────────┘    transient  │
+                   │                    error ───────┘
+                   │ success / final error
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Cost Ledger append             │  every attempt, including failures
+  │  (app role, INS)                │
+  └────────────────┬────────────────┘
+                   │
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Audit Log append               │  hash-chained SHA-256
+  │  (governance role, INS)         │
+  └─────────────────────────────────┘
+
+
+  Approval lifecycle
+  ───────────────────────────────────────────────────────────────
+
+           RequestApproval(payload_hash, risk_summary)
+                   │
+                   ▼
+              [ pending ]
+                   │
+         ┌─────────┴──────────┐
+         │                    │
+     approved             rejected
+         │                    │
+         │ ConsumeApproval     │  (terminal)
+         │ verifies:           │
+         │ · status=approved   │
+         │ · not expired       │
+         │ · payload_hash OK   │
+         │ · consumed_time=NULL│
+         ▼                     │
+     [consumed]  ◀─────────────┘  (terminal)
+         │
+         │  or if sweep runs before consumption:
+         ▼
+      [expired]  (terminal)
+
 
   ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄
   Planned (not implemented): Orchestrator, Worker, Runner,
