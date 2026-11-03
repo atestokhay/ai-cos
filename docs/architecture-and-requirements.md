@@ -2,6 +2,81 @@
 
 > This document defines the target architecture and technical requirements of AI-COS V1, including components that are not implemented yet. See the README for the current implementation status. Items described as assumptions or unapproved decisions must not be treated as final.
 
+## Implementation status
+
+| Phase | Scope | Status |
+|---|---|---|
+| Phase 1 | Modular monolith skeleton, PostgreSQL roles, health endpoints, Alembic, acceptance test | **Complete** |
+| Phase 2 | Model Router, Gateway, DeepSeek adapter, circuit breaker, Cost Ledger | **Complete** |
+| Phase 3 | Governance Engine — policy evaluation, approval lifecycle, EmergencyState, AuditLog, Budget | **Complete** (deferred items noted in §13) |
+| Phase 4+ | Worker, job queue, Step/Run tables, Workflow Engine | Planned |
+| Phase 5+ | Agent Engine, Orchestrator | Planned |
+| Phase 6+ | Web UI (PWA), WebAuthn, Git-backed policy storage | Planned |
+
+### Currently deployed components
+
+```
+apps/api      — health endpoints only
+apps/gateway  — model execution + governance admission
+```
+
+All other deployable components listed in §3.2 (`apps/worker`, `apps/runner`, `apps/web`) are planned, not implemented.
+
+### Current ASCII architecture
+
+```
+                        ┌──────────────────────────────────────────────┐
+                        │  apps/  (transport and composition)           │
+                        │                                               │
+                        │  ┌─────────────┐    ┌──────────────────────┐ │
+  HTTP (127.0.0.1) ────▶│  │  apps/api   │    │    apps/gateway      │ │
+                        │  │  /health/*  │    │  /internal/model/*   │ │
+                        │  │             │    │  ExecutionPipeline   │ │
+                        │  │             │    │  GovernancePort      │ │
+                        │  └──────┬──────┘    └──────────┬───────────┘ │
+                        └─────────│──────────────────────│─────────────┘
+                                  │                      │
+                        ┌─────────▼──────────────────────▼─────────────┐
+                        │  core/                                        │
+                        │                                               │
+                        │  ┌──────────┐  ┌────────────┐  ┌──────────┐  │
+                        │  │  health  │  │model_router│  │governance│  │
+                        │  │ domain   │  │  domain    │  │  domain  │  │
+                        │  │ appl.    │  │  appl.     │  │  appl.   │  │
+                        │  │ infra.   │  │  infra.    │  │  infra.  │  │
+                        │  └────┬─────┘  └─────┬──────┘  └────┬─────┘  │
+                        │       └───────────────┴──────────────┘        │
+                        │                       │                       │
+                        │  ┌────────────────────▼──────────────────┐   │
+                        │  │  core/foundation (settings, DB engine) │   │
+                        │  │  core/contracts  (shared Pydantic DTOs)│   │
+                        │  └───────────────────────────────────────┘   │
+                        └───────────────────────┬───────────────────────┘
+                                                │
+                        ┌───────────────────────▼───────────────────────┐
+                        │  PostgreSQL 18                                  │
+                        │                                               │
+                        │  migrator role (DDL):  all tables             │
+                        │  app role (DML):       model_registry (SEL)   │
+                        │                        cost_ledger (INS+SEL)  │
+                        │  governance role (DML):                       │
+                        │    policy_version  (INS+SEL)                  │
+                        │    verdict         (INS+SEL)                  │
+                        │    approval        (INS+SEL+UPD)              │
+                        │    budget          (SEL)                      │
+                        │    emergency_state (SEL)                      │
+                        │    audit_log       (INS+SEL, no UPD/DEL)      │
+                        └───────────────────────────────────────────────┘
+
+  apps/gateway ──────────────────────────▶ DeepSeek API (holds credential)
+
+  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄
+  Planned: Orchestrator, Worker, Runner,
+  Workflow/Agent/Memory/Initiative/Eval
+  Engines, apps/web PWA
+  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄
+```
+
 ## 1. Product scope
 
 ### 1.1 Long-term product direction
@@ -261,7 +336,90 @@ These are starting assumptions, to be tuned:
 - [ ] A backup restore attempt completes successfully.
 - [ ] Tests, security findings, cost and incomplete requirements are reported.
 
-## 12. Deferred features
+## 12. Governance engine (Phase 3 implementation)
+
+This section documents the Phase 3 implementation. See [ADR-0003](adr/0003-phase3-governance.md) for decisions and rationale.
+
+### 12.1 Principles (implemented)
+
+Governance is not an agent. It is a code-enforced control layer outside the agent hierarchy (`architecture §2`). The key implemented rules:
+- **Deny-by-default.** An unknown tool or unknown argument pattern returns `Decision.DENY` at `PermissionLevel.L4`.
+- **Models are not policy authorities.** The `evaluate()` function is a pure deterministic function; no model is consulted.
+- **Single enforcement point.** `GovernancePort` is injected into `ExecutionPipeline` in `apps/gateway`. Every `execute()` and `stream()` call runs the admission check before any provider I/O.
+
+### 12.2 Admission check sequence
+
+```
+execute() / stream()
+    │
+    ▼
+1. EmergencyState check  ─── active state found ──▶ GovernanceDeniedError (not retried)
+    │
+    ▼
+2. Policy admit (evaluate ActionContext)
+    │
+    ├── DENY ──────────────────────────────────────▶ GovernanceDeniedError (not retried)
+    │
+    └── ALLOW (approval_required=false) ──▶ provider call proceeds
+         │
+         └── ALLOW (approval_required=true, L3)
+                 │
+                 ▼
+             Verify ApprovalRequest:
+               status == approved
+               not expired
+               payload_hash matches current payload
+               consumed_time is None
+             ──── fails ──▶ GovernanceDeniedError
+             ──── passes ─▶ consume() atomically ─▶ provider call proceeds
+```
+
+`GovernanceDeniedError` inherits directly from `Exception`, not from any `ProviderError` subclass, and is not in the retry-eligible set.
+
+### 12.3 L0–L4 permission levels
+
+| Level | Meaning | Examples |
+|---|---|---|
+| L0 | Read-only / sandbox-local | Reading an authorized repo, sandbox test/build |
+| L1 | Reversible internal | Feature branch, commit, PR, internal record |
+| L2 | Internal change requiring independent review | Default branch merge, staging deploy |
+| L3 | Founder approval required | Production deploy, publish, spend, credential change |
+| L4 | Forbidden for agents | Changing governance/policy/audit, approving own work, raw secrets |
+
+Unknown tool → L4/deny. L4 → always deny regardless of actor.
+
+### 12.4 Approval integrity constraints (implemented)
+
+- **Payload-hash binding.** `ApprovalRequest.payload_hash` is `SHA-256(canonical_json(payload))`. `ConsumeApproval` recomputes the hash and rejects if it does not match the stored value.
+- **Single-use.** `consume()` runs `UPDATE … WHERE status = 'approved' AND consumed_time IS NULL`; raises `ValueError` if `rowcount == 0` (already consumed or status changed).
+- **Expiring.** `ConsumeApproval` checks `now >= request.expiry` before calling the store.
+- **Code-generated risk summaries.** `RiskSummarizer` produces the summary from the structured payload. No model is involved.
+- **No batch L3.** `RequestApproval.execute()` raises `ValueError` if `payload` is a list.
+- **No pre-approved automations in V1.** Every L3 action requires a fresh `ApprovalRequest`.
+
+**Deferred:** WebAuthn passkey verification. The `passkey_assertion_reference` column exists in the `approval` table and the passkey challenge is designed to be bound to `request_id + payload_hash`, but the actual WebAuthn challenge/response flow is not implemented. The current stub accepts a `None` reference.
+
+### 12.5 AuditLog hash chain (implemented)
+
+Every row stores `previous_row_hash = SHA-256(id || event || actor || subject || previous_row_hash)` of the preceding row. The first row stores the SHA-256 of the empty string as a known sentinel. The `SELECT` for the previous hash and the `INSERT` for the new row execute inside the same `engine.begin()` transaction. No `UPDATE` or `DELETE` is granted on `audit_log`.
+
+Deferred: daily chain verification and export of the chain head to object storage.
+
+### 12.6 EmergencyState (implemented)
+
+The `emergency_state` table is read-only for the `governance` role. `SqlEmergencyStateStore.current()` returns the most recent uncleared row. Any active state blocks the pipeline.
+
+Three levels: `agent_quarantine`, `department_pause`, `company_wide_stop`.
+
+### 12.7 Database role separation (implemented)
+
+The `governance` role is provisioned by `docker/postgres/ensure-roles.sh` (runs as `postgres` superuser on every `compose up`) and by `docker/postgres/init/01-create-roles.sh` (runs once on empty volume). Both scripts use `IF NOT EXISTS` or conditional logic.
+
+The `app` role has zero privileges on all six governance tables. This is verified by integration tests that assert `sqlstate == 42501` for every table × operation.
+
+**Deferred:** `reporting` DB role (architecture §4.1).
+
+## 13. Deferred features
 
 - Active use of a second model provider.
 - A separate vector database or semantic search.

@@ -7,15 +7,17 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic==1.20.1",
     "fastapi==0.162.0",
+    "httpx==0.28.1",
+    "jsonschema==4.23.0",
     "psycopg[binary]==3.3.6",
     "pydantic-settings==2.16.2",
     "sqlalchemy==2.1.6",
     "uvicorn==0.54.0",
+    "uuid6==2024.1.12",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx==0.28.1",
     "import-linter==2.15",
     "pytest==9.2.0",
 ]
@@ -44,7 +46,7 @@ name = "core package layering (a new core package must be placed here)"
 type = "layers"
 containers = ["core"]
 exhaustive = true
-layers = ["health", "contracts | foundation"]
+layers = ["health | model_router | governance", "contracts | foundation"]
 
 [[tool.importlinter.contracts]]
 name = "health module layering"
@@ -65,7 +67,49 @@ source_modules = ["apps.api.routes"]
 forbidden_modules = ["core.health.infrastructure"]
 
 [[tool.importlinter.contracts]]
+name = "model_router module layering"
+type = "layers"
+containers = ["core.model_router"]
+layers = ["infrastructure", "application", "domain"]
+
+[[tool.importlinter.contracts]]
+name = "model_router domain and application stay framework free"
+type = "forbidden"
+source_modules = [
+    "core.model_router.domain",
+    "core.model_router.application",
+]
+forbidden_modules = ["fastapi", "starlette", "sqlalchemy", "psycopg", "httpx"]
+
+[[tool.importlinter.contracts]]
+name = "gateway routes must not reach infrastructure or adapters"
+type = "forbidden"
+source_modules = ["apps.gateway.routes"]
+forbidden_modules = ["core.model_router.infrastructure", "apps.gateway.adapters"]
+
+[[tool.importlinter.contracts]]
 name = "application code must not run migrations"
 type = "forbidden"
 source_modules = ["apps", "core"]
 forbidden_modules = ["alembic"]
+
+[[tool.importlinter.contracts]]
+name = "governance module layering"
+type = "layers"
+containers = ["core.governance"]
+layers = ["infrastructure", "application", "domain"]
+
+[[tool.importlinter.contracts]]
+name = "governance domain and application stay framework free"
+type = "forbidden"
+source_modules = [
+    "core.governance.domain",
+    "core.governance.application",
+]
+forbidden_modules = ["fastapi", "starlette", "sqlalchemy", "psycopg", "httpx"]
+
+[[tool.importlinter.contracts]]
+name = "gateway routes must not reach governance infrastructure"
+type = "forbidden"
+source_modules = ["apps.gateway.routes"]
+forbidden_modules = ["core.governance.infrastructure"]
