@@ -58,93 +58,45 @@ Stop it with `sudo docker compose down`. **`sudo docker compose down -v` permane
 
 ## Architecture
 
+**Request lifecycle (Gateway — execute / stream)**
+
+```mermaid
+flowchart TD
+    A([Incoming request]) --> B{X-Internal-Secret\nauth check}
+    B -- fail --> C([401 Unauthorized])
+    B -- pass --> D{EmergencyState\ncheck\ngovernance · SEL}
+    D -- active --> E([GovernanceDeniedError])
+    D -- none active --> F{Policy evaluation\ndeny-by-default\nunknown → L4}
+    F -- DENY --> G([GovernanceDeniedError\nnever retried])
+    F -- ALLOW --> H{Approval gate\nL3 only}
+    H -- "missing / expired\nhash mismatch\nalready consumed" --> I([GovernanceDeniedError])
+    H -- "approved\n+ consume()" --> J[Budget check\nPhase 4 — deferred]
+    J --> K[Provider call\nDeepSeek adapter]
+    K -- transient error --> L{retry ≤ 3\nexp. backoff + jitter}
+    L -- retry --> K
+    L -- attempts exhausted --> M[Cost Ledger append\napp · INS\nevery attempt incl. failures]
+    K -- success --> M
+    M --> N[Audit Log append\ngovernance · INS\nhash-chained SHA-256]
+    N --> O([Response])
 ```
-  Request lifecycle (Gateway — execute / stream)
-  ───────────────────────────────────────────────────────────────
 
-  Incoming request
-       │
-       ▼
-  ┌─────────────────────────────────┐
-  │  X-Internal-Secret auth check   │  fail ──▶  401
-  └────────────────┬────────────────┘
-                   │ pass
-                   ▼
-  ┌─────────────────────────────────┐
-  │  EmergencyState check           │  active ──▶  GovernanceDeniedError
-  │  (governance role, SEL)         │
-  └────────────────┬────────────────┘
-                   │ none active
-                   ▼
-  ┌─────────────────────────────────┐
-  │  Policy evaluation              │  DENY ──▶  GovernanceDeniedError
-  │  deny-by-default; unknown → L4  │            (never retried)
-  └────────────────┬────────────────┘
-                   │ ALLOW
-                   ▼
-  ┌─────────────────────────────────┐
-  │  Approval gate (L3 only)        │  missing / expired / hash mismatch
-  │  verify: status=approved,       │  ──▶  GovernanceDeniedError
-  │  not expired, payload_hash OK,  │
-  │  not consumed → consume()       │
-  └────────────────┬────────────────┘
-                   │ approved
-                   ▼
-  ┌─────────────────────────────────┐
-  │  Budget check                   │  (Phase 4 — wiring deferred)
-  └────────────────┬────────────────┘
-                   │
-                   ▼
-  ┌─────────────────────────────────┐   retry ≤3
-  │  Provider call                  │◀──────────────┐
-  │  (DeepSeek adapter)             │               │
-  └────────────────┬────────────────┘    transient  │
-                   │                    error ───────┘
-                   │ success / final error
-                   ▼
-  ┌─────────────────────────────────┐
-  │  Cost Ledger append             │  every attempt, including failures
-  │  (app role, INS)                │
-  └────────────────┬────────────────┘
-                   │
-                   ▼
-  ┌─────────────────────────────────┐
-  │  Audit Log append               │  hash-chained SHA-256
-  │  (governance role, INS)         │
-  └─────────────────────────────────┘
+**Approval lifecycle**
 
+```mermaid
+stateDiagram-v2
+    [*] --> pending : RequestApproval\n(payload_hash, risk_summary)
 
-  Approval lifecycle
-  ───────────────────────────────────────────────────────────────
+    pending --> approved : founder approves
+    pending --> rejected : founder rejects
+    pending --> expired : ExpireApprovals sweep\nbefore approval
 
-           RequestApproval(payload_hash, risk_summary)
-                   │
-                   ▼
-              [ pending ]
-                   │
-         ┌─────────┴──────────┐
-         │                    │
-     approved             rejected
-         │                    │
-         │ ConsumeApproval     │  (terminal)
-         │ verifies:           │
-         │ · status=approved   │
-         │ · not expired       │
-         │ · payload_hash OK   │
-         │ · consumed_time=NULL│
-         ▼                     │
-     [consumed]  ◀─────────────┘  (terminal)
-         │
-         │  or if sweep runs before consumption:
-         ▼
-      [expired]  (terminal)
+    approved --> consumed : ConsumeApproval\n· status = approved\n· not expired\n· payload_hash matches\n· consumed_time IS NULL\n· atomic UPDATE rowcount = 1
+    approved --> rejected : RejectApproval
+    approved --> expired : ExpireApprovals sweep\nbefore consumption
 
-
-  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄
-  Planned (not implemented): Orchestrator, Worker, Runner,
-  Workflow Engine, Agent Engine, Memory Engine, Initiative
-  Engine, Evaluation Engine, apps/web (PWA)
-  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄
+    consumed --> [*]
+    rejected --> [*]
+    expired --> [*]
 ```
 
 | Path | Responsibility |
