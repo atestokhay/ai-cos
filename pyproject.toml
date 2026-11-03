@@ -1,0 +1,71 @@
+[project]
+name = "ai-cos"
+version = "0.1.0"
+description = "AI-COS V1 modular monolith"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic==1.20.1",
+    "fastapi==0.162.0",
+    "psycopg[binary]==3.3.6",
+    "pydantic-settings==2.16.2",
+    "sqlalchemy==2.1.6",
+    "uvicorn==0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "import-linter==2.15",
+    "pytest==9.2.0",
+]
+
+[tool.uv]
+package = false
+exclude-newer = "2026-11-01T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.importlinter]
+root_packages = ["apps", "core"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "core must not depend on apps"
+type = "forbidden"
+source_modules = ["core"]
+forbidden_modules = ["apps"]
+
+[[tool.importlinter.contracts]]
+name = "core package layering (a new core package must be placed here)"
+type = "layers"
+containers = ["core"]
+exhaustive = true
+layers = ["health", "contracts | foundation"]
+
+[[tool.importlinter.contracts]]
+name = "health module layering"
+type = "layers"
+containers = ["core.health"]
+layers = ["infrastructure", "application", "domain"]
+
+[[tool.importlinter.contracts]]
+name = "domain and application stay framework free"
+type = "forbidden"
+source_modules = ["core.health.domain", "core.health.application"]
+forbidden_modules = ["fastapi", "starlette", "sqlalchemy", "psycopg"]
+
+[[tool.importlinter.contracts]]
+name = "routes must not reach infrastructure"
+type = "forbidden"
+source_modules = ["apps.api.routes"]
+forbidden_modules = ["core.health.infrastructure"]
+
+[[tool.importlinter.contracts]]
+name = "application code must not run migrations"
+type = "forbidden"
+source_modules = ["apps", "core"]
+forbidden_modules = ["alembic"]

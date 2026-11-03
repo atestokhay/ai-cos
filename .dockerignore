@@ -1,0 +1,14 @@
+# Allow-list: only what an image needs enters the build context.
+*
+!pyproject.toml
+!uv.lock
+!alembic.ini
+!apps/
+!core/
+!migrations/
+!tests/
+
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
