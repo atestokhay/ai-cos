@@ -349,6 +349,8 @@ Governance is not an agent. It is a code-enforced control layer outside the agen
 
 ### 12.2 Admission check sequence
 
+> **Composition-root requirement:** `ExecutionPipeline` currently accepts `governance=None`; in that configuration its admission check is skipped. Every real gateway instance must inject a concrete `GovernancePort`. Making this dependency mandatory and testing the production composition is still required before production use.
+
 ```
 execute() / stream()
     │
@@ -399,11 +401,15 @@ Unknown tool → L4/deny. L4 → always deny regardless of actor.
 
 **Deferred:** WebAuthn passkey verification. The `passkey_assertion_reference` column exists in the `approval` table and the passkey challenge is designed to be bound to `request_id + payload_hash`, but the actual WebAuthn challenge/response flow is not implemented. The current stub accepts a `None` reference.
 
-### 12.5 AuditLog hash chain (implemented)
+### 12.5 AuditLog hash chain (implemented with a concurrency limitation)
 
-Every row stores `previous_row_hash = SHA-256(id || event || actor || subject || previous_row_hash)` of the preceding row. The first row stores the SHA-256 of the empty string as a known sentinel. The `SELECT` for the previous hash and the `INSERT` for the new row execute inside the same `engine.begin()` transaction. No `UPDATE` or `DELETE` is granted on `audit_log`.
+Each row stores `previous_row_hash`, derived from the preceding row's canonical fields. The first row uses the SHA-256 hash of the empty string as a sentinel. The current writer performs the read of the previous hash and the insert in one `engine.begin()` transaction; the database role has no `UPDATE` or `DELETE` grant on `audit_log`.
 
-Deferred: daily chain verification and export of the chain head to object storage.
+**Important limitation:** a transaction does not by itself serialize concurrent appends. Two transactions may read the same latest row before either inserts, creating two rows with the same predecessor and therefore a fork. The current implementation does not yet acquire a chain-wide lock or otherwise serialize writers. Until a transaction-scoped advisory lock or locked chain-head record is implemented and concurrent-writer tests pass, the hash chain must not be described or relied upon as concurrency-safe production audit integrity.
+
+A hash chain also does not prevent an actor with sufficient database privileges from rewriting the entire chain. Production-grade tamper evidence requires tightly controlled write access plus independent verification and external anchoring of chain heads.
+
+Deferred: append serialization, concurrent-writer tests, daily chain verification and export of the chain head to independent object storage.
 
 ### 12.6 EmergencyState (implemented)
 
