@@ -16,7 +16,7 @@ You need Docker Engine with the Compose plugin. The daemon does not start automa
 **1. Clone the repository**
 
 ```bash
-git clone https://github.com/<atestokhay>/ai-cos.git
+git clone https://github.com/atestokhay/ai-cos.git
 cd ai-cos
 ```
 
@@ -178,9 +178,13 @@ stateDiagram-v2
 
 ### Known limitations
 
-- There is no authentication on `apps/api` health endpoints. No rate limit is applied.
-- `SqlPolicyStore.load_policy()` returns a deny-all stub in Phase 3; policy rules are not yet loaded from Git.
+The following are explicit implementation gaps, not merely roadmap items. The repository is an engineering prototype and must not be treated as production-ready.
+
+- **Governance wiring is optional at the `ExecutionPipeline` constructor.** If the composition root creates the pipeline without a `GovernancePort`, the current `_check_governance()` implementation returns without checking policy or emergency state. The deployed composition must inject a real governance adapter; this is not yet enforced by a mandatory constructor contract.
+- **Audit-log concurrent append is not serialized.** The current writer reads the previous hash and inserts the next row in one database transaction, but that alone does not prevent two concurrent transactions from reading the same chain head and creating a fork. Serialize appends (for example, with a transaction-scoped advisory lock or a locked chain-head row) and add a concurrent-writer test before relying on the chain for production audit integrity.
+- `SqlPolicyStore.load_policy()` returns a deny-all stub; policy rules are not yet loaded from Git.
 - WebAuthn passkey verification is not implemented; `passkey_assertion_reference` is stored but never verified.
+- Budget reservation and hard-stop enforcement are not yet wired into the model-call pipeline.
 - No production deployment is defined. The `runtime` image is built and tested but not published.
 - There is no CI yet; test results come from local runs.
 - `run_id` and `step_id` in `cost_ledger` are nullable placeholders; populated once the Worker and Step table exist.
