@@ -91,14 +91,20 @@ All constraints enforced in `core/governance/application/`:
 - **Self-approval of L4 actions is blocked.** L4 → always deny; no approval path exists for L4 actions.
 - **Silence is not approval.** A missing or non-`approved` status returns `DENY`.
 
-### 8. AuditLog: append-only, hash-chained
+### 8. AuditLog: append-only, hash-chained (concurrency hardening deferred)
 
 ```
 row N: { id, event, actor, subject, previous_row_hash = SHA-256(row N-1 canonical) }
 row 0: { ..., previous_row_hash = SHA-256("") }   # sentinel
 ```
 
-`SqlAuditLog.append()` runs the `SELECT` for the previous row's hash and the `INSERT` for the new row inside the same `engine.begin()` transaction. `INSERT, SELECT` are the only grants; no `UPDATE` or `DELETE` is ever issued or grantable.
+`SqlAuditLog.append()` performs the read of the previous row's hash and the insert inside the same `engine.begin()` transaction. The `governance` role receives only `INSERT, SELECT`; it has no `UPDATE` or `DELETE` grant.
+
+**Known limitation:** the transaction does not serialize concurrent appenders. Two transactions can read the same chain head and insert sibling rows, forking the chain. The Phase 3 implementation does not yet use a transaction-scoped advisory lock or a locked chain-head row. This must be fixed and covered by a concurrent-writer integration test before production use. A hash chain alone also cannot stop a sufficiently privileged database actor from rewriting the full chain; independent verification and external anchoring are required for stronger tamper evidence.
+
+### 8.1 Governance dependency wiring
+
+`ExecutionPipeline` currently accepts an optional `GovernancePort`. If constructed with `governance=None`, the admission check is skipped. The gateway composition root must always inject the concrete governance adapter. A mandatory dependency and a production-composition test remain outstanding.
 
 ### 9. EmergencyState
 
